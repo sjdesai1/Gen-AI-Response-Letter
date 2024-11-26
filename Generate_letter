@@ -1,0 +1,315 @@
+import pandas as pd
+import ast
+import traceback
+import os
+import json
+from gensim.models.doc2vec import Doc2Vec, TaggedDocument
+from google.cloud import storage, bigquery
+from datetime import datetime, timezone
+from appeals.utils.bq import run_sql_query, Update_BQ_Table, DF_To_BQ_Table
+from appeals.utils.prompts import (
+    build_mcg_prompt,
+    build_clinical_info_prompt,
+    build_mcg_retrieval_prompt,
+    mn_prompt,
+)
+from appeals.parse_835 import load_data
+from appeals.queries.queries import (
+    query_835,
+    query_test_cases,
+    query_mednec_data,
+    query_helios,
+)
+from appeals.utils.templates import (
+    mednec_template,
+    lackauth_template,
+    ending_template,
+    abstract_template,
+    uhc_template,
+)
+from appeals.utils.mcg_reader import combine_mcg_txt, read_mcg_txt
+from appeals.utils.gemini import generate_text
+from appeals.assets.doc_builder import generate_header, generate_body
+from appeals.log import init_logger
+from appeals.schemas import appeals_schema, helios_schema
+
+# Initialize logger
+logger = init_logger()
+
+
+def combine_notes(rows):
+    """Combine all notes into a list of dicts."""
+    notes_list = [
+        {
+            "document_type": row.document_type,
+            "fhir_db_update_date_time_utc": str(row.fhir_db_update_date_time_utc),
+            "document_text": row.decoded_document_text,
+        }
+        for _, row in rows.iterrows()
+    ]
+    notes_list = json.dumps(notes_list)
+    hlc_org_id = rows.hlc_org_id.iloc[0]
+    org_name = rows.org_name.iloc[0]
+    patient_name = rows.patient.iloc[0]
+    payer = rows.payer.iloc[0]
+    adj_code = rows.adj_0_code.iloc[0]
+    rem_code = rows.rem_0_code.iloc[0]
+    encounter_start = rows.encounter_start.iloc[0]
+    encounter_end = rows.encounter_end.iloc[0]
+
+    new_row = pd.Series(
+        {
+            "hlc_org_id": hlc_org_id,
+            "org_name": org_name,
+            "patient": patient_name,
+            "payer": payer,
+            "note": notes_list,
+            "adj_0_code": adj_code,
+            "rem_0_code": rem_code,
+            "encounter_start": encounter_start,
+            "encounter_end": encounter_end,
+        }
+    )
+
+    return new_row
+
+
+def load_chunk_data():
+    """Load chunk_text data from BigQuery table for Doc2Vec processing."""
+    client = bigquery.Client()
+    query = """
+    SELECT chunk_text 
+    FROM `prj-cdw-p-aiml-001-0b36.Sonny_Workspace.MCG_Chunks_Manual`
+    """
+    return client.query(query).to_dataframe()
+
+
+def train_doc2vec(df_chunks):
+    """Convert chunk_text to Doc2Vec vectors."""
+    documents = [
+        TaggedDocument(words=row["chunk_text"].split(), tags=[str(i)])
+        for i, row in df_chunks.iterrows()
+    ]
+    model = Doc2Vec(documents, vector_size=100, window=5, min_count=1, workers=4)
+    return model
+
+
+def build_rag_prompt(note, model, df_chunks):
+    """Retrieve relevant chunks based on the note using Doc2Vec embeddings for RAG."""
+    note_words = note.split()
+    df_chunks["similarity"] = df_chunks["chunk_text"].apply(
+        lambda x: model.similarity_unseen_docs(note_words, x.split())
+    )
+    top_chunks = df_chunks.nlargest(5, "similarity")
+    return "\n\n".join(top_chunks["chunk_text"].tolist())
+
+
+def generate_mn_prompt(row):
+    """Generate a two-midnight rule prompt based on the row data."""
+    # Use the mn_prompt function from appeals.utils.prompts
+    return mn_prompt(row)
+
+
+def get_letter(row):
+    """Prompt the model and parse output to dict."""
+    count = 0
+    while count < 5:
+        count += 1
+        appeal_output = generate_text(row.appeals_prompt)[0]
+        output_processed = process_output(appeal_output)
+
+        if isinstance(output_processed, dict):
+            return appeal_output, output_processed
+        else:
+            logger.error("Retrying letter generation")
+    logger.error("Failed to process letter after 5 attempts")
+    return appeal_output, "Error"
+
+
+def process_output(appeal_str):
+    """Parse the appeal output into a dictionary."""
+    try:
+        return json.loads(appeal_str)
+    except:
+        logger.error("Failed to parse appeal output")
+        return "Error processing output"
+
+
+def build_letter(appeal_dict, org_name, mn_verbiage, uhc_verbiage):
+    """Construct the appeal letter from provided components."""
+    mn_verbiage_str = mn_verbiage["justification"] if mn_verbiage else ""
+    uhc_str = uhc_verbiage if uhc_verbiage else ""
+    abstract = abstract_template(org_name)
+    summary = appeal_dict.get("Reason for denial", {}).get(
+        "Clinical Summary", "No summary available"
+    )
+    guidelines = appeal_dict.get("Reason for denial", {}).get(
+        "MCG Guidelines", "No guidelines available"
+    )
+    ending = ending_template()
+    return {
+        "abstract": abstract,
+        "summary": summary,
+        "guidelines": guidelines,
+        "ending": ending,
+        "mn_verbiage": mn_verbiage_str,
+        "uhc_verbiage": uhc_str,
+    }
+
+
+def generate_letters(gen_type="prod") -> pd.DataFrame:
+    """
+    Runner function to generate letters.
+
+    Parameters
+    ----------
+    gen_type: str, optional, default='prod'
+        Determines what data to pull for generating letters.
+    """
+    logger.info("Beginning letter generation process")
+    logger.info(f"gen_type is: {gen_type}")
+    # Query 835 data
+    try:
+        if gen_type == "prod":
+            df = query_mednec_data()
+        elif gen_type == "test":
+            df = query_test_cases()
+        elif gen_type == "helios":
+            df = query_helios()
+    except:
+        logger.error("Query failed")
+        logger.error(traceback.print_exc())
+        return pd.DataFrame()
+
+    logger.info("835 data queried")
+    logger.info(f"Number of notes to process: {df.shape[0]}")
+
+    df["note"] = df.decoded_document_text
+    df_mednec = df.copy()
+
+    # Get discharge summaries
+    logger.info("Getting discharge summaries")
+    discharge_summaries = df_mednec[df_mednec.document_type == "Discharge Summary"][
+        ["encounter_id", "hlc_org_id", "note", "fhir_db_update_date_time_utc"]
+    ]
+    discharge_summaries.rename(columns={"note": "discharge_summary"}, inplace=True)
+
+    # Combine notes into single row
+    logger.info("Combining notes into single row for each encounter")
+    df_mednec = df_mednec.groupby("encounter_id").apply(combine_notes).reset_index()
+    df_mednec = df_mednec.iloc[:20]
+
+    # Load chunk data and train Doc2Vec model
+    df_chunks = load_chunk_data()
+    doc2vec_model = train_doc2vec(df_chunks)
+
+    # Generate RAG-based prompts and retrieve relevant chunks
+    df_mednec["rag_prompt"] = df_mednec["note"].apply(
+        lambda x: build_rag_prompt(x, doc2vec_model, df_chunks)
+    )
+
+    # Generate two-midnight verbiage prompt and verbiage
+    logger.info("Generating 2 midnight verbiage prompt")
+    df_mednec["mn_verbiage_prompt"] = df_mednec.apply(
+        lambda x: generate_mn_prompt(x), axis=1
+    )
+    logger.info("Generating 2 midnight verbiage")
+    df_mednec["mn_verbiage"] = df_mednec["mn_verbiage_prompt"].apply(
+        lambda x: generate_text(x)[0] if x else None
+    )
+    df_mednec["mn_verbiage"] = df_mednec["mn_verbiage"].apply(
+        lambda x: json.loads(x) if x else None
+    )
+
+    # Process codes
+    df_mednec["adj_codes"] = df_mednec["adj_0_code"]
+    df_mednec["rem_codes"] = df_mednec["rem_0_code"]
+
+    # Determine MCG guideline to load
+    df_mednec["mcg_file_prompt"] = df_mednec["note"].apply(
+        lambda x: build_mcg_retrieval_prompt(x)
+    )
+    df_mednec["mcg_file"] = df_mednec["mcg_file_prompt"].apply(lambda x: generate_text(x))
+    df_mednec["mcg_file"] = df_mednec["mcg_file"].apply(
+        lambda x: ast.literal_eval(x[0]) if x[0] != "ERROR!" else None
+    )
+    df_mednec.dropna(subset=["mcg_file"], inplace=True)
+
+    # Get MCG text
+    df_mednec["mcg_text"] = df_mednec["mcg_file"].apply(lambda x: read_mcg_txt(x))
+
+    # Get decision tree for MCG
+    df_mednec["mcg_dt"] = df_mednec.apply(lambda x: build_mcg_prompt(x.mcg_text), axis=1)
+
+    # Generate appeal template and prompts
+    df_mednec["template"] = mednec_template()
+    df_mednec["appeals_prompt"] = df_mednec.apply(
+        lambda x: build_clinical_info_prompt(x, logic=x.mcg_dt), axis=1
+    )
+    df_mednec["uhc_verbiage"] = df_mednec["payer"].apply(lambda x: uhc_template(x))
+
+    # Prompt the model and parse output
+    logger.info("Prompting model for appeals letter")
+    try:
+        df_mednec[["output", "output_processed"]] = pd.DataFrame(
+            df_mednec.apply(lambda x: get_letter(x), axis=1).tolist(),
+            index=df_mednec.index,
+        )
+    except:
+        logger.error(traceback.print_exc())
+
+    # Get letter components
+    df_mednec["appeal_components"] = df_mednec.apply(
+        lambda x: build_letter(
+            x.output_processed, x.org_name, x.mn_verbiage, x.uhc_verbiage
+        )
+        if isinstance(x.output_processed, dict)
+        else "Error",
+        axis=1,
+    )
+
+    return df_mednec
+
+
+def display_letter_in_notebook(row):
+    """Display the generated appeal letter in notebook cell format."""
+    components_dict = row.appeal_components
+    appeal_dict = row.output_processed
+
+    if not isinstance(components_dict, dict) or not isinstance(appeal_dict, dict):
+        print("Error in letter components.")
+        return
+    elif "Error" in components_dict.get("summary", ""):
+        print("Error in clinical summary.")
+        return
+
+    print("----- Appeal Letter -----\n")
+    print("**Abstract:**")
+    print(components_dict.get("abstract", "No abstract available."), "\n")
+    print("**Clinical Summary:**")
+    print(components_dict.get("summary", "No clinical summary available."), "\n")
+    print("**MCG Guidelines:**")
+    print(components_dict.get("guidelines", "No MCG guidelines available."), "\n")
+
+    mn_verbiage_str = components_dict.get("mn_verbiage", "")
+    if mn_verbiage_str:
+        print("**Two-Midnight Rule Justification:**")
+        print(mn_verbiage_str, "\n")
+
+    uhc_str = components_dict.get("uhc_verbiage", "")
+    if uhc_str:
+        print("**UHC Specific Verbiage:**")
+        print(uhc_str, "\n")
+
+    print("**Closing Remarks:**")
+    print(components_dict.get("ending", "No closing remarks available."), "\n")
+    print("----- End of Letter -----")
+
+
+# Example usage
+# Assuming `generate_letters()` runs successfully and retrieves data
+generate_letters_result = generate_letters(gen_type="prod")
+if not generate_letters_result.empty:
+    display_letter_in_notebook(generate_letters_result.iloc[0])
+else:
+    print("No letters were generated.")
